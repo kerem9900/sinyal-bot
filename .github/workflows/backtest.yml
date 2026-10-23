@@ -1,0 +1,27 @@
+name: backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Kaç günlük geçmiş test edilsin"
+        default: "90"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - run: python backtest.py --days "$DAYS" --telegram
+        env:
+          DAYS: ${{ github.event.inputs.days }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOLS: SOLUSDT
