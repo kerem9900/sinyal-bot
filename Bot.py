@@ -245,5 +245,166 @@ def evaluate(entry, mid, htf):
                            f"({fmt(z['lo'])}-{fmt(z['hi'])})")
                 break
 
-        # 4) RSI (+1, aşırı
+        # 4) RSI (+1, aşırı bölgede -1)
+        rn, rp = rs[-1], rs[-2]
+        if rn is not None and rp is not None:
+            recent = [x for x in rs[-7:-1] if x is not None]
+            if up:
+                if (rn > rp and 35 <= rn <= 65) or (recent and min(recent) < 30 and rn > 30):
+                    score += 1
+                    why.append(f"RSI {rn:.0f} yükseliyor / aşırı satımdan dönüş")
+                if rn > 70:
+                    score -= 1
+                    why.append(f"RSI {rn:.0f} aşırı alım (-1)")
+            else:
+                if (rn < rp and 35 <= rn <= 65) or (recent and max(recent) > 70 and rn < 70):
+                    score += 1
+                    why.append(f"RSI {rn:.0f} düşüyor / aşırı alımdan dönüş")
+                if rn < 30:
+                    score -= 1
+                    why.append(f"RSI {rn:.0f} aşırı satım (-1)")
 
+        # 5) Hacim teyidi (+1)
+        in_favor = last["c"] > last["o"] if up else last["c"] < last["o"]
+        if avg_v and last["v"] > 1.5 * avg_v and in_favor:
+            score += 1
+            why.append(f"Hacim ortalamanın {last['v'] / avg_v:.1f} katı")
+
+        # 6) Yapı kırılımı (+1)
+        if up and sh is not None and closes[-1] > sh and min(closes[-4:-1]) <= sh:
+            score += 1
+            why.append(f"Son tepe kırıldı ({fmt(sh)})")
+        if (not up) and sl is not None and closes[-1] < sl and max(closes[-4:-1]) >= sl:
+            score += 1
+            why.append(f"Son dip kırıldı ({fmt(sl)})")
+
+        levels = None
+        if a:
+            risk = 1.5 * a
+            sgn = 1 if up else -1
+            levels = {"stop": price - sgn * risk,
+                      "tp1": price + sgn * 1.5 * risk,
+                      "tp2": price + sgn * 3 * risk}
+        out[side] = {"score": max(0, score), "why": why, "levels": levels}
+    return out
+
+
+# ----------------------------- BİLDİRİM -----------------------------
+def fmt(p):
+    return f"{p:,.2f}" if p >= 10 else (f"{p:.4f}" if p >= 1 else f"{p:.6f}")
+
+
+def format_msg(symbol, side, res):
+    s = res[side]
+    icon = "🟢 LONG" if side == "long" else "🔴 SHORT"
+    now = datetime.now(TR_TZ).strftime("%d.%m %H:%M")
+    lines = [f"{icon} fırsatı: {symbol} ({ENTRY_TF})",
+             f"Puan: {s['score']}/{MAX_SCORE}   |   {now}",
+             f"Fiyat: {fmt(res['price'])}"]
+    if s["levels"]:
+        lv = s["levels"]
+        lines.append(f"Stop: {fmt(lv['stop'])}  |  TP1: {fmt(lv['tp1'])}  |  TP2: {fmt(lv['tp2'])}")
+        lines.append("(ATR bazlı öneri: stop 1.5xATR, TP1 1.5R, TP2 3R)")
+    lines.append("")
+    lines.append("Gerekçeler:")
+    lines += [f"• {w}" for w in s["why"]]
+    lines.append("")
+    lines.append("⚠️ Yatırım tavsiyesi değildir. Grafiği kendin doğrula, stop-loss kullan.")
+    return "\n".join(lines)
+
+
+def send_telegram(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print("[Telegram ayarlı değil, ekrana yazıyorum]\n" + text + "\n")
+        return False
+    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": text}, timeout=15)
+    if not r.ok:
+        print("Telegram hatası:", r.status_code, r.text)
+    return r.ok
+
+
+# ----------------------------- ÇALIŞTIRMA -----------------------------
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def evaluate_symbol(symbol):
+    entry = get_klines(symbol, ENTRY_TF, 500)
+    mid = get_klines(symbol, MID_TF, 300)
+    htf = get_klines(symbol, HTF, 500)
+    return evaluate(entry, mid, htf)
+
+
+def run_once(status_only=False):
+    state = load_state()
+    now = time.time()
+    for sym in SYMBOLS:
+        try:
+            res = evaluate_symbol(sym)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{sym}] hata: {e}")
+            continue
+        L, S = res["long"], res["short"]
+        print(f"[{datetime.now(TR_TZ):%H:%M}] {sym} fiyat {fmt(res['price'])} | "
+              f"LONG {L['score']}/{MAX_SCORE} | SHORT {S['score']}/{MAX_SCORE}")
+        if status_only:
+            for name, x in (("LONG", L), ("SHORT", S)):
+                for w in x["why"]:
+                    print(f"   {name}: {w}")
+            continue
+        for side in ("long", "short"):
+            if res[side]["score"] < MIN_SCORE:
+                continue
+            key = f"{sym}:{side}"
+            if now - state.get(key, 0) < COOLDOWN_MIN * 60:
+                continue
+            send_telegram(format_msg(sym, side, res))
+            state[key] = now
+    if not status_only:
+        save_state(state)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--once", action="store_true", help="tek sefer kontrol et ve çık")
+    p.add_argument("--status", action="store_true", help="puanları göster, bildirim gönderme")
+    p.add_argument("--test", action="store_true", help="Telegram test mesajı gönder")
+    args = p.parse_args()
+
+    if args.test:
+        ok = send_telegram("✅ Sinyal botu bağlantısı çalışıyor.")
+        sys.exit(0 if ok else 1)
+    if args.status:
+        run_once(status_only=True)
+        return
+    if args.once:
+        run_once()
+        return
+
+    print(f"Bot başladı. Semboller: {', '.join(SYMBOLS)} | TF: {ENTRY_TF} | "
+          f"Min puan: {MIN_SCORE}/{MAX_SCORE} | Kontrol: {CHECK_EVERY_SEC}s")
+    while True:
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print("Döngü hatası:", e)
+        time.sleep(CHECK_EVERY_SEC)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nBot durduruldu.")
